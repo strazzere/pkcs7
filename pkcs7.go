@@ -19,7 +19,10 @@ import (
 	"sort"
 	"time"
 
-	_ "crypto/sha1" // for crypto.SHA1
+	"github.com/fullsailor/pkcs7/internal/x509util"
+
+	_ "crypto/sha1"   // for crypto.SHA1
+	_ "crypto/sha256" // for crypto.SHA256
 )
 
 // PKCS7 Represents a PKCS7 structure
@@ -226,6 +229,7 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 	if err != nil {
 		return err
 	}
+
 	if len(signer.AuthenticatedAttributes) > 0 {
 		// TODO(fullsailor): First check the content type match
 		var digest []byte
@@ -234,7 +238,9 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 			return err
 		}
 		h := hash.New()
-		h.Write(p7.Content)
+		if _, err := h.Write(p7.Content); err != nil {
+			return err
+		}
 		computed := h.Sum(nil)
 		if !hmac.Equal(digest, computed) {
 			return &MessageDigestMismatchError{
@@ -254,18 +260,23 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 		return errors.New("pkcs7: No certificate for signer")
 	}
 
-	algo := getSignatureAlgorithmFromAI(signer.DigestEncryptionAlgorithm)
-	if algo == x509.UnknownSignatureAlgorithm {
-		// I'm not sure what the spec here is, and the openssl sources were not
-		// helpful. But, this is what App Store receipts appear to do.
-		// The DigestEncryptionAlgorithm is just "rsaEncryption (PKCS #1)"
-		// But we're expecting a digest + encryption algorithm. So... we're going
-		// to determine an algorithm based on the DigestAlgorithm and this
-		// encryption algorithm.
-		if signer.DigestEncryptionAlgorithm.Algorithm.Equal(oidEncryptionAlgorithmRSA) {
-			algo = getRSASignatureAlgorithmForDigestAlgorithm(hash)
+	oid := signer.DigestAlgorithm.Algorithm
+	sigAlgorithmOid := signer.DigestEncryptionAlgorithm.Algorithm
+	var algo x509.SignatureAlgorithm
+
+	switch {
+	case oid.Equal(oidDigestAlgorithmSHA1) && sigAlgorithmOid.Equal(oidEncryptionAlgorithmRSA):
+		algo = x509.SHA1WithRSA
+	case oid.Equal(oidDigestAlgorithmSHA1) && sigAlgorithmOid.Equal(oidSignatureDSAWithSHA1):
+		algo = x509.DSAWithSHA1
+	default:
+		var err error
+		algo, _, err = x509util.SignatureAlgorithmDetailsForOid(oid)
+		if err != nil {
+			return err
 		}
 	}
+
 	return cert.CheckSignature(algo, signedData, signer.EncryptedDigest)
 }
 
@@ -284,7 +295,14 @@ func marshalAttributes(attrs []attribute) ([]byte, error) {
 }
 
 var (
-	oidDigestAlgorithmSHA1    = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
+	oidDigestAlgorithmSHA1 = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
+	// note from https://github.com/golang/go/blob/3ca8ee14d15d8fdf152c28e98812347419f8084c/src/crypto/x509/x509.go#L305
+	//
+	// oidISOSignatureSHA1WithRSA means the same as oidSignatureSHA1WithRSA
+	// but it's specified by ISO. Microsoft's makecert.exe has been known
+	// to produce certificates with this OID.
+	//	oidISOSignatureSHA1WithRSA = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 29}
+	//	oidSHA256                  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	oidEncryptionAlgorithmRSA = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 )
 
@@ -299,12 +317,13 @@ func getCertFromCertsByIssuerAndSerial(certs []*x509.Certificate, ias issuerAndS
 
 func getHashForOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 	switch {
-	case oid.Equal(oidDigestAlgorithmSHA1):
+	case oid.Equal(oidDigestAlgorithmSHA1), oid.Equal(oidISOSignatureSHA1WithRSA):
 		return crypto.SHA1, nil
-  case oid.Equal(oidSHA256):
-    return crypto.SHA256, nil
+	case oid.Equal(oidSHA256):
+		return crypto.SHA256, nil
 	}
-	return crypto.Hash(0), ErrUnsupportedAlgorithm
+	_, hash, err := x509util.SignatureAlgorithmDetailsForOid(oid)
+	return hash, err
 }
 
 func getRSASignatureAlgorithmForDigestAlgorithm(hash crypto.Hash) x509.SignatureAlgorithm {
@@ -352,6 +371,22 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pk crypto.PrivateKey) ([]byte, 
 	}
 	fmt.Printf("Unsupported Private Key: %v\n", pk)
 	return nil, ErrUnsupportedAlgorithm
+}
+
+func (p7 *PKCS7) EncryptionAlgorithm() (int, error) {
+	data, ok := p7.raw.(envelopedData)
+	if !ok {
+		return 0, ErrNotEncryptedContent
+	}
+	alg := data.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
+	switch {
+	case alg.Equal(oidEncryptionAlgorithmDESCBC), alg.Equal(oidEncryptionAlgorithmDESEDE3CBC):
+		return EncryptionAlgorithmDESCBC, nil
+	case alg.Equal(oidEncryptionAlgorithmAES256CBC), alg.Equal(oidEncryptionAlgorithmAES128GCM), alg.Equal(oidEncryptionAlgorithmAES128CBC):
+		return EncryptionAlgorithmAES128GCM, nil
+	default:
+		return 0, ErrUnsupportedAlgorithm
+	}
 }
 
 var oidEncryptionAlgorithmDESCBC = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 7}
@@ -524,9 +559,10 @@ func (p7 *PKCS7) UnmarshalSignedAttribute(attributeType asn1.ObjectIdentifier, o
 
 // SignedData is an opaque data structure for creating signed data payloads
 type SignedData struct {
-	sd            signedData
-	certs         []*x509.Certificate
-	messageDigest []byte
+	sd              signedData
+	certs           []*x509.Certificate
+	messageDigest   []byte
+	digestAlgorithm pkix.AlgorithmIdentifier
 }
 
 // Attribute represents a key value pair attribute. Value must be marshalable byte
@@ -542,7 +578,19 @@ type SignerInfoConfig struct {
 }
 
 // NewSignedData initializes a SignedData with content
-func NewSignedData(data []byte) (*SignedData, error) {
+func NewSignedData(data []byte, opts ...Option) (*SignedData, error) {
+	// Since the digestAlgorithm and hash function here are hardcoded we need to
+	// ensure that they match up with the SignatureAlgorithm used in AddSigner
+	// TODO: Make this more dynamic so we determine the digestAlgorithm and
+	// signatureAlgorithm from the key being used.
+	c := &config{
+		digestAlgorithm: pkix.AlgorithmIdentifier{
+			Algorithm: oidSHA256,
+		},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
 	content, err := asn1.Marshal(data)
 	if err != nil {
 		return nil, err
@@ -551,18 +599,16 @@ func NewSignedData(data []byte) (*SignedData, error) {
 		ContentType: oidData,
 		Content:     asn1.RawValue{Class: 2, Tag: 0, Bytes: content, IsCompound: true},
 	}
-	digAlg := pkix.AlgorithmIdentifier{
-		Algorithm: oidDigestAlgorithmSHA1,
+	h := crypto.SHA256.New()
+	if _, err := h.Write(data); err != nil {
+		return nil, err
 	}
-	h := crypto.SHA1.New()
-	h.Write(data)
-	md := h.Sum(nil)
 	sd := signedData{
 		ContentInfo:                ci,
 		Version:                    1,
-		DigestAlgorithmIdentifiers: []pkix.AlgorithmIdentifier{digAlg},
+		DigestAlgorithmIdentifiers: []pkix.AlgorithmIdentifier{c.digestAlgorithm},
 	}
-	return &SignedData{sd: sd, messageDigest: md}, nil
+	return &SignedData{sd: sd, messageDigest: h.Sum(nil), digestAlgorithm: c.digestAlgorithm}, nil
 }
 
 type attributes struct {
@@ -642,7 +688,14 @@ func (sd *SignedData) AddSigner(cert *x509.Certificate, pkey crypto.PrivateKey, 
 	if err != nil {
 		return err
 	}
-	signature, err := signAttributes(finalAttrs, pkey, crypto.SHA1)
+	key, ok := pkey.(crypto.Signer)
+	if !ok {
+		return errors.New("pkcs7: signer private key does not implement crypto.Signer")
+	}
+
+	// TODO @groob pass a SignatureAlgorithm
+	hash, digAlgo, sigAlgo, err := x509util.SigningParamsForPublicKey(key.Public(), x509.SHA256WithRSA)
+	signature, err := signAttributes(finalAttrs, pkey, hash)
 	if err != nil {
 		return err
 	}
@@ -654,8 +707,8 @@ func (sd *SignedData) AddSigner(cert *x509.Certificate, pkey crypto.PrivateKey, 
 
 	signer := signerInfo{
 		AuthenticatedAttributes:   finalAttrs,
-		DigestAlgorithm:           pkix.AlgorithmIdentifier{Algorithm: oidDigestAlgorithmSHA1},
-		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: oidSignatureSHA1WithRSA},
+		DigestAlgorithm:           digAlgo,
+		DigestEncryptionAlgorithm: sigAlgo,
 		IssuerAndSerialNumber:     ias,
 		EncryptedDigest:           signature,
 		Version:                   1,
@@ -712,7 +765,7 @@ func signAttributes(attrs []attribute, pkey crypto.PrivateKey, hash crypto.Hash)
 	hashed := h.Sum(nil)
 	switch priv := pkey.(type) {
 	case *rsa.PrivateKey:
-		return rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA1, hashed)
+		return rsa.SignPKCS1v15(rand.Reader, priv, hash, hashed)
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
@@ -875,6 +928,33 @@ func encryptDESCBC(content []byte) ([]byte, *encryptedContentInfo, error) {
 	return key, &eci, nil
 }
 
+type config struct {
+	ContentEncryptionAlgorithm int
+	digestAlgorithm            pkix.AlgorithmIdentifier
+}
+
+// Option allows customizing the Encryption Algorithm and Hashing functions used
+// by the Encrypt function.
+type Option func(*config)
+
+// WithEncryptionAlgorithm configures Encrypt to use a specific EncryptionAlgorithm.
+func WithEncryptionAlgorithm(algo int) Option {
+	return func(c *config) {
+		c.ContentEncryptionAlgorithm = algo
+	}
+}
+
+func WithDigestAlgorithm(algo x509.SignatureAlgorithm) Option {
+	return func(c *config) {
+		switch algo {
+		case x509.SHA256WithRSA:
+			c.digestAlgorithm = pkix.AlgorithmIdentifier{Algorithm: oidSHA256}
+		default:
+			c.digestAlgorithm = pkix.AlgorithmIdentifier{Algorithm: oidDigestAlgorithmSHA1}
+		}
+	}
+}
+
 // Encrypt creates and returns an envelope data PKCS7 structure with encrypted
 // recipient keys for each recipient public key.
 //
@@ -886,13 +966,19 @@ func encryptDESCBC(content []byte) ([]byte, *encryptedContentInfo, error) {
 //     ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
 //
 // TODO(fullsailor): Add support for encrypting content with other algorithms
-func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+func Encrypt(content []byte, recipients []*x509.Certificate, opts ...Option) ([]byte, error) {
+	c := &config{
+		ContentEncryptionAlgorithm: ContentEncryptionAlgorithm,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
 	var eci *encryptedContentInfo
 	var key []byte
 	var err error
 
 	// Apply chosen symmetric encryption method
-	switch ContentEncryptionAlgorithm {
+	switch c.ContentEncryptionAlgorithm {
 	case EncryptionAlgorithmDESCBC:
 		key, eci, err = encryptDESCBC(content)
 
